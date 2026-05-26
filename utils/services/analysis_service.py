@@ -3,11 +3,12 @@ import re
 import logging
 import urllib.request
 import urllib.error
+import time
 
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fallback result – returned when we cannot parse Gemini's response at all
+# Fallback result – used only if all retries fail
 # ---------------------------------------------------------------------------
 _FALLBACK = {
     "greeting": 0,
@@ -17,36 +18,45 @@ _FALLBACK = {
     "diagnostics": 0,
     "history_asked": 0,
     "professionalism_ok": True,
-    "comment": "",
+    "comment": "PARSE_ERROR – review manually",
 }
+
+# Keys that must be present in a valid response
+_REQUIRED_KEYS = {"greeting", "body_known", "year_known",
+                  "mileage_known", "diagnostics", "history_asked",
+                  "professionalism_ok"}
 
 
 class AnalysisService:
+    # -----------------------------------------------------------------------
+    # Prompt asks for a COMPACT single-line JSON so the model wastes no tokens
+    # on indentation and is far less likely to be cut off.
+    # -----------------------------------------------------------------------
     SYSTEM_PROMPT = (
-        "You are a quality-assurance analyst for a car-service call centre.\n"
-        "You receive a transcript of a call between a manager and a customer.\n"
-        "Respond ONLY with a single valid JSON object – no markdown, no code fences, "
-        "no extra text before or after.\n\n"
-        "Schema (all keys required, use only these exact key names):\n"
-        "{\n"
-        '  "greeting":          0 or 1,\n'
-        '  "body_known":        0 or 1,\n'
-        '  "year_known":        0 or 1,\n'
-        '  "mileage_known":     0 or 1,\n'
-        '  "diagnostics":       0 or 1,\n'
-        '  "history_asked":     0 or 1,\n'
-        '  "professionalism_ok": true or false,\n'
-        '  "comment":           "one sentence if professionalism_ok is false, else empty string"\n'
-        "}\n\n"
-        "Scoring rules:\n"
-        "- 1 = criterion clearly met, 0 = not met or unclear.\n"
-        "- professionalism_ok = false only if the manager was rude, dismissive, or unprofessional.\n"
-        "- comment must use straight ASCII double-quotes only; no curly/smart quotes.\n"
-        "- Return NOTHING except the JSON object."
+        "You are a QA analyst for a car-service call centre.\n"
+        "Analyse the transcript and return ONE compact JSON object on a single line "
+        "(no indentation, no markdown, no extra text).\n\n"
+        'Required format (copy exactly, replace values only):\n'
+        '{"greeting":0,"body_known":0,"year_known":0,"mileage_known":0,'
+        '"diagnostics":0,"history_asked":0,"professionalism_ok":true,"comment":""}\n\n'
+        "Rules:\n"
+        "- Each score: 1 = clearly met, 0 = not met or unclear.\n"
+        "- greeting: manager introduced themselves at the start.\n"
+        "- body_known: manager asked/knew the vehicle body type.\n"
+        "- year_known: manager asked/knew the car year.\n"
+        "- mileage_known: manager asked/knew the mileage.\n"
+        "- diagnostics: manager proposed a comprehensive diagnostics service.\n"
+        "- history_asked: manager asked what work was done before.\n"
+        "- professionalism_ok: false ONLY if the manager was rude or unprofessional.\n"
+        "- comment: one short English sentence if professionalism_ok is false; "
+        'empty string "" otherwise.\n'
+        "- Use only straight ASCII double-quotes. No trailing commas.\n"
+        "Output ONLY the JSON line."
     )
 
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, max_retries: int = 3):
         self.api_key = api_key
+        self.max_retries = max_retries
         self.url = (
             "https://generativelanguage.googleapis.com/v1beta/models/"
             f"gemini-3.5-flash:generateContent?key={self.api_key}"
@@ -56,10 +66,20 @@ class AnalysisService:
     # Public API
     # ------------------------------------------------------------------
     def analyze(self, transcript: str) -> dict:
-        raw = self._call_gemini(transcript)
-        log.debug("  Gemini raw response:\n%s", raw)
-        result = self._parse_json(raw)
-        return result
+        for attempt in range(1, self.max_retries + 1):
+            raw = self._call_gemini(transcript)
+            log.debug("  Gemini attempt %d raw:\n%s", attempt, raw)
+
+            result = self._parse_json(raw)
+            if result is not None:
+                return result
+
+            log.warning("  Attempt %d/%d: could not parse response, retrying…",
+                        attempt, self.max_retries)
+            time.sleep(1)
+
+        log.error("  All %d attempts failed – writing fallback zeros.", self.max_retries)
+        return dict(_FALLBACK)
 
     # ------------------------------------------------------------------
     # Private helpers
@@ -70,8 +90,8 @@ class AnalysisService:
             "contents": [{"parts": [{"text": f"TRANSCRIPT:\n{transcript}"}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 512,
-                "responseMimeType": "application/json",   # force JSON mode
+                "maxOutputTokens": 1024,           # plenty of headroom; schema is ~80 tokens
+                "responseMimeType": "application/json",
             },
         }
 
@@ -81,50 +101,87 @@ class AnalysisService:
         )
 
         try:
-            with urllib.request.urlopen(req, timeout=60) as resp:
+            with urllib.request.urlopen(req, timeout=90) as resp:
                 body = json.loads(resp.read())
         except urllib.error.HTTPError as exc:
             log.error("  Gemini HTTP %s: %s", exc.code, exc.read().decode())
             raise
 
-        return body["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Check finish reason – MAX_TOKENS means response was cut off
+        candidate = body["candidates"][0]
+        finish = candidate.get("finishReason", "")
+        if finish == "MAX_TOKENS":
+            log.warning("  Gemini hit MAX_TOKENS – response truncated!")
+
+        return candidate["content"]["parts"][0]["text"].strip()
 
     @staticmethod
-    def _parse_json(raw: str) -> dict:
+    def _parse_json(raw: str) -> dict | None:
         """
-        Multi-stage JSON extraction that survives common Gemini quirks:
-          1. Straight parse
-          2. Strip markdown fences (```json … ```)
-          3. Extract first {...} block via regex
-          4. Replace curly/smart quotes with straight ones
-          5. Return fallback with a warning
+        Try progressively looser strategies to extract valid JSON.
+        Returns a dict on success, None on failure (so caller can retry).
         """
-        attempts = [
-            raw,
-            re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip(),
+        # Normalise smart/curly quotes everywhere before any attempt
+        cleaned = (
+            raw
+            .replace("\u201c", '"').replace("\u201d", '"')
+            .replace("\u2018", "'").replace("\u2019", "'")
+            .replace("\u00ab", '"').replace("\u00bb", '"')
+        )
+
+        candidates = [
+            cleaned,
+            # strip markdown fences
+            re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip(),
         ]
 
-        for text in attempts:
+        # Also try extracting the first complete {...} block
+        m = re.search(r"\{[^{}]*\}", cleaned, re.DOTALL)
+        if m:
+            candidates.append(m.group(0))
+
+        # If the JSON is truncated, try to salvage it by closing the object
+        # and filling missing keys with 0/defaults
+        if "{" in cleaned and "}" not in cleaned:
+            salvaged = AnalysisService._salvage_truncated(cleaned)
+            if salvaged:
+                candidates.append(salvaged)
+
+        for text in candidates:
             try:
-                return json.loads(text)
+                obj = json.loads(text)
+                if isinstance(obj, dict) and _REQUIRED_KEYS.issubset(obj):
+                    return obj
+                # partial dict – fill missing keys with defaults and accept
+                if isinstance(obj, dict) and any(k in obj for k in _REQUIRED_KEYS):
+                    log.warning("  Partial JSON – filling missing keys with 0.")
+                    return {**_FALLBACK, **obj}
+            except json.JSONDecodeError:
+                continue
+
+        return None  # signal failure to caller
+
+    @staticmethod
+    def _salvage_truncated(raw: str) -> str | None:
+        """
+        When Gemini returns something like:
+            {"greeting": 1, "body_known": 0, "year_known":
+        parse what we have, fill the rest with 0/defaults, re-serialise.
+        """
+        # Collect all key:value pairs that DID parse cleanly
+        kv_re = re.compile(r'"(\w+)"\s*:\s*(\d+|true|false|"[^"]*")')
+        found = {}
+        for key, val_str in kv_re.findall(raw):
+            try:
+                found[key] = json.loads(val_str)
             except json.JSONDecodeError:
                 pass
 
-        # Stage 3 – grab first {...} block
-        m = re.search(r"\{.*?\}", raw, re.DOTALL)
-        if m:
-            candidate = m.group(0)
-            # Stage 4 – normalise smart/curly quotes
-            candidate = (
-                candidate
-                .replace("\u201c", '"').replace("\u201d", '"')   # " "
-                .replace("\u2018", "'").replace("\u2019", "'")   # ' '
-                .replace("\u00ab", '"').replace("\u00bb", '"')   # « »
-            )
-            try:
-                return json.loads(candidate)
-            except json.JSONDecodeError as exc:
-                log.warning("  Could not parse extracted JSON block: %s\n  Raw block: %s", exc, candidate)
+        if not found:
+            return None
 
-        log.error("  All JSON parse attempts failed. Raw Gemini output:\n%s", raw)
-        return dict(_FALLBACK)  # safe default – row still written, no crash
+        merged = {**_FALLBACK, **found}
+        merged.pop("comment", None)
+        merged["comment"] = found.get("comment", "")
+        log.warning("  Salvaged partial keys: %s", list(found.keys()))
+        return json.dumps(merged)
