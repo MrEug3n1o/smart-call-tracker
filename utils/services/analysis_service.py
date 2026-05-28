@@ -8,50 +8,112 @@ import time
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
+# Top-100 allowed job list (Ukrainian)
+# ---------------------------------------------------------------------------
+TOP_100_JOBS = [
+    "Комп'ютерна діагностика",
+    "Заміна оливи ДВЗ + масляний фільтр",
+    "Комплексна діагностика",
+    "Ендоскопія",
+    "Заміна повітряного фільтра ДВЗ",
+    "Заміна фільтра салону в салоновому відділенні",
+    "Заміна сайлентблоку",
+    "Зняття / встановлення важеля",
+    "Заміна еластичної муфти карданного валу",
+    "Слюсарні роботи",
+    "Діагностика підвіски (НЕ ВИКОРИСТОВУЄМ)ВИКОРИСТОВУЄМ КОМПЛЕКСНУ",
+    "Зняття / встановлення важеля прд.",
+    "Заміна амортизатора переднього",
+    "Заміна оливи АКПП",
+    "Мийка / чистка деталі",
+    "Зняття / встановлення повітряного патрубка",
+    "Заміна охолоджувальної рідини",
+    "Заміна гальмівної рідини з прокачкою",
+    "Заміна оливи в зд. редукторі",
+    "Кодування опцій",
+    "Заміна амортизатора зд.",
+    "Заміна гальмівних дисків та колодок прд.",
+]
+
+_TOP_100_JSON = json.dumps(TOP_100_JOBS, ensure_ascii=False)
+
+# ---------------------------------------------------------------------------
 # Fallback result – used only if all retries fail
 # ---------------------------------------------------------------------------
 _FALLBACK = {
-    "greeting": 0,
-    "body_known": 0,
-    "year_known": 0,
-    "mileage_known": 0,
-    "diagnostics": 0,
-    "history_asked": 0,
-    "professionalism_ok": True,
-    "comment": "PARSE_ERROR – review manually",
+    "call_type":         "Вхідний дзвінок",
+    "branch":            "",
+    "manager_name":      "",
+    "greeting":          0,
+    "body_known":        0,
+    "year_known":        0,
+    "mileage_known":     0,
+    "diagnostics":       0,
+    "history_asked":     0,
+    "appointment_made":  0,
+    "chosen_job":        "інший варіант",
+    "top100_adhered":    0,
+    "top100_recommended":0,
+    "final_result":      "",
+    "spare_parts":       "",
+    "comment":           "PARSE_ERROR – review manually",
 }
 
-# Keys that must be present in a valid response
-_REQUIRED_KEYS = {"greeting", "body_known", "year_known",
-                  "mileage_known", "diagnostics", "history_asked",
-                  "professionalism_ok"}
+# Binary score keys that contribute to the total
+SCORE_KEYS = [
+    "greeting", "body_known", "year_known", "mileage_known",
+    "diagnostics", "history_asked", "appointment_made",
+    "top100_adhered", "top100_recommended",
+]
+
+_REQUIRED_KEYS = set(SCORE_KEYS) | {"call_type", "chosen_job", "final_result", "comment"}
 
 
 class AnalysisService:
-    # -----------------------------------------------------------------------
-    # Prompt asks for a COMPACT single-line JSON so the model wastes no tokens
-    # on indentation and is far less likely to be cut off.
-    # -----------------------------------------------------------------------
     SYSTEM_PROMPT = (
-        "You are a QA analyst for a car-service call centre.\n"
-        "Analyse the transcript and return ONE compact JSON object on a single line "
-        "(no indentation, no markdown, no extra text).\n\n"
-        'Required format (copy exactly, replace values only):\n'
-        '{"greeting":0,"body_known":0,"year_known":0,"mileage_known":0,'
-        '"diagnostics":0,"history_asked":0,"professionalism_ok":true,"comment":""}\n\n'
-        "Rules:\n"
-        "- Each score: 1 = clearly met, 0 = not met or unclear.\n"
-        "- greeting: manager introduced themselves at the start.\n"
-        "- body_known: manager asked/knew the vehicle body type.\n"
-        "- year_known: manager asked/knew the car year.\n"
-        "- mileage_known: manager asked/knew the mileage.\n"
-        "- diagnostics: manager proposed a comprehensive diagnostics service.\n"
-        "- history_asked: manager asked what work was done before.\n"
-        "- professionalism_ok: false ONLY if the manager was rude or unprofessional.\n"
-        "- comment: one short English sentence if professionalism_ok is false; "
-        'empty string "" otherwise.\n'
+        "You are a QA analyst for a Ukrainian car-service call centre.\n"
+        "Analyse the call transcript and return ONE compact JSON object on a SINGLE LINE "
+        "(no indentation, no markdown, no extra text before or after).\n\n"
+
+        "Required JSON template (copy key names exactly, replace values only):\n"
+        '{"call_type":"Вхідний дзвінок","branch":"","manager_name":"",'
+        '"greeting":0,"body_known":0,"year_known":0,"mileage_known":0,'
+        '"diagnostics":0,"history_asked":0,"appointment_made":0,'
+        '"chosen_job":"інший варіант","top100_adhered":0,"top100_recommended":0,'
+        '"final_result":"","spare_parts":"","comment":""}\n\n'
+
+        "Field rules:\n"
+        "call_type      – Classify the call reason/type in Ukrainian (e.g. 'Вхідний дзвінок', "
+        "'Запис на сервіс', 'Консультація'). Default: 'Вхідний дзвінок'.\n"
+        "branch         – City or branch name if mentioned (e.g. 'Київ'), else empty string.\n"
+        "manager_name   – Manager's first name if they introduced themselves, else empty string.\n"
+        "greeting       – 1 if the manager introduced themselves by name at the start, else 0.\n"
+        "body_known     – 1 if the manager asked or already knew the vehicle body type, else 0.\n"
+        "year_known     – 1 if the manager asked or already knew the car manufacture year, else 0.\n"
+        "mileage_known  – 1 if the manager asked or already knew the mileage, else 0.\n"
+        "diagnostics    – 1 if the manager proposed a comprehensive diagnostics service, else 0.\n"
+        "history_asked  – 1 if the manager asked about prior repair/maintenance history, else 0.\n"
+        "appointment_made – 1 if the call ended with a booked service appointment, else 0.\n"
+
+        f"chosen_job     – Match the primary service discussed to ONE item from this list:\n"
+        f"{_TOP_100_JSON}\n"
+        "If no item from that list was discussed, return \"інший варіант\".\n"
+
+        "top100_adhered    – 1 if the manager correctly followed the upsell/script rules "
+        "for the matched Top-100 job (proper proposal, pricing, next steps), else 0. "
+        "If chosen_job is 'інший варіант', set to 0.\n"
+        "top100_recommended – 1 if the manager proactively recommended relevant Top-100 services "
+        "beyond what the customer asked for, else 0.\n"
+        "final_result   – Short Ukrainian phrase describing the call outcome: "
+        "'Запис на сервіс', 'Повторна консультація', 'Відмова', or empty string.\n"
+        "spare_parts    – Comma-separated list of any spare parts mentioned, or empty string.\n"
+        "comment        – MANDATORY short Ukrainian summary if ANY binary score is 0, "
+        "explicitly listing what the manager missed. Empty string only if ALL scores are 1.\n\n"
+
+        "General rules:\n"
+        "- Binary scores: 1 = criterion clearly met, 0 = not met or unclear.\n"
         "- Use only straight ASCII double-quotes. No trailing commas.\n"
-        "Output ONLY the JSON line."
+        "- Output ONLY the single JSON line."
     )
 
     def __init__(self, api_key: str, max_retries: int = 3):
@@ -90,7 +152,7 @@ class AnalysisService:
             "contents": [{"parts": [{"text": f"TRANSCRIPT:\n{transcript}"}]}],
             "generationConfig": {
                 "temperature": 0,
-                "maxOutputTokens": 1024,           # plenty of headroom; schema is ~80 tokens
+                "maxOutputTokens": 2048,
                 "responseMimeType": "application/json",
             },
         }
@@ -107,21 +169,15 @@ class AnalysisService:
             log.error("  Gemini HTTP %s: %s", exc.code, exc.read().decode())
             raise
 
-        # Check finish reason – MAX_TOKENS means response was cut off
         candidate = body["candidates"][0]
-        finish = candidate.get("finishReason", "")
-        if finish == "MAX_TOKENS":
+        if candidate.get("finishReason") == "MAX_TOKENS":
             log.warning("  Gemini hit MAX_TOKENS – response truncated!")
 
         return candidate["content"]["parts"][0]["text"].strip()
 
     @staticmethod
     def _parse_json(raw: str) -> dict | None:
-        """
-        Try progressively looser strategies to extract valid JSON.
-        Returns a dict on success, None on failure (so caller can retry).
-        """
-        # Normalise smart/curly quotes everywhere before any attempt
+        # Normalise smart/curly quotes
         cleaned = (
             raw
             .replace("\u201c", '"').replace("\u201d", '"')
@@ -131,17 +187,13 @@ class AnalysisService:
 
         candidates = [
             cleaned,
-            # strip markdown fences
             re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.MULTILINE).strip(),
         ]
 
-        # Also try extracting the first complete {...} block
         m = re.search(r"\{[^{}]*\}", cleaned, re.DOTALL)
         if m:
             candidates.append(m.group(0))
 
-        # If the JSON is truncated, try to salvage it by closing the object
-        # and filling missing keys with 0/defaults
         if "{" in cleaned and "}" not in cleaned:
             salvaged = AnalysisService._salvage_truncated(cleaned)
             if salvaged:
@@ -150,25 +202,21 @@ class AnalysisService:
         for text in candidates:
             try:
                 obj = json.loads(text)
-                if isinstance(obj, dict) and _REQUIRED_KEYS.issubset(obj):
+                if not isinstance(obj, dict):
+                    continue
+                if _REQUIRED_KEYS.issubset(obj):
                     return obj
-                # partial dict – fill missing keys with defaults and accept
-                if isinstance(obj, dict) and any(k in obj for k in _REQUIRED_KEYS):
-                    log.warning("  Partial JSON – filling missing keys with 0.")
+                # partial – fill gaps with fallback values
+                if any(k in obj for k in _REQUIRED_KEYS):
+                    log.warning("  Partial JSON – filling missing keys with defaults.")
                     return {**_FALLBACK, **obj}
             except json.JSONDecodeError:
                 continue
 
-        return None  # signal failure to caller
+        return None
 
     @staticmethod
     def _salvage_truncated(raw: str) -> str | None:
-        """
-        When Gemini returns something like:
-            {"greeting": 1, "body_known": 0, "year_known":
-        parse what we have, fill the rest with 0/defaults, re-serialise.
-        """
-        # Collect all key:value pairs that DID parse cleanly
         kv_re = re.compile(r'"(\w+)"\s*:\s*(\d+|true|false|"[^"]*")')
         found = {}
         for key, val_str in kv_re.findall(raw):
@@ -176,12 +224,8 @@ class AnalysisService:
                 found[key] = json.loads(val_str)
             except json.JSONDecodeError:
                 pass
-
         if not found:
             return None
-
         merged = {**_FALLBACK, **found}
-        merged.pop("comment", None)
-        merged["comment"] = found.get("comment", "")
         log.warning("  Salvaged partial keys: %s", list(found.keys()))
-        return json.dumps(merged)
+        return json.dumps(merged, ensure_ascii=False)
