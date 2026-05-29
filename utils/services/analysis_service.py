@@ -41,25 +41,24 @@ _TOP_100_JSON = json.dumps(TOP_100_JOBS, ensure_ascii=False)
 # Fallback result – used only if all retries fail
 # ---------------------------------------------------------------------------
 _FALLBACK = {
-    "call_type":         "Вхідний дзвінок",
-    "branch":            "",
-    "manager_name":      "",
-    "greeting":          0,
-    "body_known":        0,
-    "year_known":        0,
-    "mileage_known":     0,
-    "diagnostics":       0,
-    "history_asked":     0,
-    "appointment_made":  0,
-    "chosen_job":        "інший варіант",
-    "top100_adhered":    0,
-    "top100_recommended":0,
-    "final_result":      "",
-    "spare_parts":       "",
-    "comment":           "PARSE_ERROR – review manually",
+    "call_type": "Вхідний дзвінок",
+    "branch": "",
+    "manager_name": "",
+    "greeting": 0,
+    "body_known": 0,
+    "year_known": 0,
+    "mileage_known": 0,
+    "diagnostics": 0,
+    "history_asked": 0,
+    "appointment_made": 0,
+    "chosen_job": "інший варіант",
+    "top100_adhered": 0,
+    "top100_recommended": 0,
+    "final_result": "Повторна консультація",
+    "spare_parts": "",
+    "comment": "PARSE_ERROR – review manually",
 }
 
-# Binary score keys that contribute to the total
 SCORE_KEYS = [
     "greeting", "body_known", "year_known", "mileage_known",
     "diagnostics", "history_asked", "appointment_made",
@@ -71,50 +70,46 @@ _REQUIRED_KEYS = set(SCORE_KEYS) | {"call_type", "chosen_job", "final_result", "
 
 class AnalysisService:
     SYSTEM_PROMPT = (
-        "You are a QA analyst for a Ukrainian car-service call centre.\n"
-        "Analyse the call transcript and return ONE compact JSON object on a SINGLE LINE "
-        "(no indentation, no markdown, no extra text before or after).\n\n"
+        "You are an expert QA analyst for a Ukrainian car-service call centre.\n"
+        "Analyse the call transcript and return ONE valid JSON object.\n\n"
 
-        "Required JSON template (copy key names exactly, replace values only):\n"
+        "Required JSON template:\n"
         '{"call_type":"Вхідний дзвінок","branch":"","manager_name":"",'
         '"greeting":0,"body_known":0,"year_known":0,"mileage_known":0,'
         '"diagnostics":0,"history_asked":0,"appointment_made":0,'
         '"chosen_job":"інший варіант","top100_adhered":0,"top100_recommended":0,'
-        '"final_result":"","spare_parts":"","comment":""}\n\n'
+        '"final_result":"","spare_parts":"","comment":""}\n\n"'
+
+        "CRITICAL EVALUATION RULES (BE FLEXIBLE AND FAIR):\n"
+        "1. greeting:\n"
+        "   - Set to 1 if the manager greets the client politely at the beginning.\n"
+        "   - Do NOT penalize or set to 0 just because the manager omitted their personal name, as long as a polite corporate greeting took place.\n\n"
+
+        "2. body_known, year_known, mileage_known:\n"
+        "   - Set to 1 if this vehicle information becomes known during the call.\n"
+        "   - LOGIC: If the client names their car model/body type, year, or mileage proactively on their own initiative without being asked, ALWAYS count this as 1. The manager is considered to have processed and 'accepted' this data. Do not set to 0 just because there was no explicit question from the manager.\n\n"
 
         "Field rules:\n"
-        "call_type      – Classify the call reason/type in Ukrainian (e.g. 'Вхідний дзвінок', "
-        "'Запис на сервіс', 'Консультація'). Default: 'Вхідний дзвінок'.\n"
-        "branch         – City or branch name if mentioned (e.g. 'Київ'), else empty string.\n"
-        "manager_name   – Manager's first name if they introduced themselves, else empty string.\n"
-        "greeting       – 1 if the manager introduced themselves by name at the start, else 0.\n"
-        "body_known     – 1 if the manager asked or already knew the vehicle body type, else 0.\n"
-        "year_known     – 1 if the manager asked or already knew the car manufacture year, else 0.\n"
-        "mileage_known  – 1 if the manager asked or already knew the mileage, else 0.\n"
+        "call_type      – Classify the call reason/type in Ukrainian (e.g. 'Вхідний дзвінок', 'Авто в роботі', 'Повторний дзвінок'). Default: 'Вхідний дзвінок'.\n"
+        "branch         – City or branch name if mentioned, else empty string.\n"
+        "manager_name   – Manager's name if mentioned, else empty string.\n"
         "diagnostics    – 1 if the manager proposed a comprehensive diagnostics service, else 0.\n"
         "history_asked  – 1 if the manager asked about prior repair/maintenance history, else 0.\n"
         "appointment_made – 1 if the call ended with a booked service appointment, else 0.\n"
 
         f"chosen_job     – Match the primary service discussed to ONE item from this list:\n"
         f"{_TOP_100_JSON}\n"
-        "If no item from that list was discussed, return \"інший варіант\".\n"
+        "If no item from that list matches perfectly, return \"інший варіант\".\n"
 
-        "top100_adhered    – 1 if the manager correctly followed the upsell/script rules "
-        "for the matched Top-100 job (proper proposal, pricing, next steps), else 0. "
-        "If chosen_job is 'інший варіант', set to 0.\n"
-        "top100_recommended – 1 if the manager proactively recommended relevant Top-100 services "
-        "beyond what the customer asked for, else 0.\n"
-        "final_result   – Short Ukrainian phrase describing the call outcome: "
-        "'Запис на сервіс', 'Повторна консультація', 'Відмова', or empty string.\n"
+        "top100_adhered    – 1 if the manager correctly followed the upsell/script rules for the matched Top-100 job. If chosen_job is 'інший варіант', set to 0.\n"
+        "top100_recommended – 1 if the manager proactively recommended relevant Top-100 services beyond what the customer initially asked for, else 0.\n"
+        "final_result   – Short Ukrainian phrase describing the call outcome: 'Запис на сервіс', 'Повторна консультація', or 'Відмова'.\n"
         "spare_parts    – Comma-separated list of any spare parts mentioned, or empty string.\n"
-        "comment        – MANDATORY short Ukrainian summary if ANY binary score is 0, "
-        "explicitly listing what the manager missed. Empty string only if ALL scores are 1.\n\n"
+        "comment        – If ANY binary score is 0: write ONE short Ukrainian sentence (max 20 words) explaining what criteria were missed.\"\" only when ALL 9 binary scores are 1.\n\n"
 
-        "General rules:\n"
-        "- Binary scores: 1 = criterion clearly met, 0 = not met or unclear.\n"
-        "- Use only straight ASCII double-quotes. No trailing commas.\n"
-        "- Output ONLY the single JSON line."
+        "Output ONLY valid JSON code."
     )
+
 
     def __init__(self, api_key: str, max_retries: int = 3):
         self.api_key = api_key

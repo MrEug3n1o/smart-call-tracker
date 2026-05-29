@@ -49,16 +49,16 @@ class CallAnalyticsPipeline:
                  analysis.get("chosen_job", "—"),
                  analysis.get("final_result", "—"))
 
-        # 5 – write row
-        row_num = self.sheets.append_row(sheet_id, meta, analysis, tab)
+        # 5 – write row (ТЕПЕРЬ ПОЛУЧАЕМ И ДАННЫЕ СТРОКИ)
+        row_num, row_data = self.sheets.append_row(sheet_id, meta, analysis, tab)
 
-        # 6 – flag row red if appointment was missed OR Top-100 not adhered to
+        # 6 – flag cells red if appointment was missed OR Top-100 not adhered to
         appointment_ok = bool(analysis.get("appointment_made", 0))
         top100_ok      = bool(analysis.get("top100_adhered", 0))
 
         if not appointment_ok or not top100_ok:
-            # tab name is passed; sheets_service resolves the real numeric sheetId
-            self.sheets.highlight_row_red(sheet_id, row_num, tab)
+            # Вызываем новый метод для точечного окрашивания ячеек
+            self.sheets.highlight_cells_red(sheet_id, row_num, row_data, tab)
 
             comment = analysis.get("comment", "").strip()
             if not comment:
